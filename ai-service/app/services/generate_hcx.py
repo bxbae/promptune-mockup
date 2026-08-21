@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import torch
 
@@ -95,6 +96,73 @@ def _build_preference_context(preference: dict[str, str]) -> str:
     return "\n".join(parts) if parts else "없음"
 
 
+
+def _build_effective_user_prompt(req: GenerateRequest) -> str:
+    """
+    Retrieval에서는 원본 사용자 요청을 사용하고,
+    Generation에서는 이미 검색된 문서의 파일명(locator)을 제거해
+    실제 수행할 요청만 HCX에 전달한다.
+    """
+    original = req.prompt.strip()
+
+    if not original or not req.documents:
+        return original
+
+    titles = sorted(
+        {
+            document.title.strip()
+            for document in req.documents
+            if document.title and document.title.strip()
+        },
+        key=len,
+        reverse=True,
+    )
+
+    normalized = original
+    matched_title = False
+
+    for title in titles:
+        candidates = [
+            title + "의 ",
+            title + "에서 ",
+            title + "을 ",
+            title + "를 ",
+            title + "으로 ",
+            title + "로 ",
+            title,
+        ]
+
+        for candidate in candidates:
+            if candidate in normalized:
+                normalized = normalized.replace(candidate, "", 1)
+                matched_title = True
+                break
+
+    if not matched_title:
+        return original
+
+    prefixes = [
+        "내부 문서에서 ",
+        "내부문서에서 ",
+        "사내 문서에서 ",
+        "사내문서에서 ",
+        "회사 문서에서 ",
+        "회사문서에서 ",
+    ]
+
+    for prefix in prefixes:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip()
+            break
+
+    normalized = " ".join(normalized.split()).strip()
+
+    if not normalized:
+        normalized = "핵심 내용을 알려줘"
+
+    return "제공된 내부 문서에서 " + normalized
+
+
 def _build_prompt(
     req: GenerateRequest,
     web_results: list[dict],
@@ -103,6 +171,7 @@ def _build_prompt(
     web_context = _build_web_context(web_results)
     user_context = _build_user_context(req.user_context)
     preference_context = _build_preference_context(req.preference)
+    user_prompt = _build_effective_user_prompt(req)
 
     parts = [
         "너는 업무용 AI 어시스턴트다.",
@@ -117,14 +186,11 @@ def _build_prompt(
         "6. 웹 검색 결과가 제공되지 않은 경우 그 사실을 답변에서 언급하지 마.",
         "7. 사용자 프로필은 실제로 제공된 경우에만 활용해.",
         "8. 최종 답변만 출력하고 분석 과정은 출력하지 마.",
-        "9. [내부 문서] 섹션의 내용은 파일에서 이미 검색·추출되어 제공된 실제 본문이야. 파일을 새로 열 필요가 없어.",
-        "10. 사용자 요청에 파일명이나 문서명이 포함되어 있어도 제공된 내부 문서 본문에서 답을 찾아.",
-        "11. 요청한 정보가 내부 문서 본문에 존재하면 직접 답하고, 실제로 존재하지 않을 때만 찾을 수 없다고 말해.",
-        "12. 사용자 선호도가 제공된 경우, 그 스타일(속도/설명 분량/원문 존중도)에 맞춰 답변을 조정해.",
+        "9. 사용자 선호도가 제공된 경우, 그 스타일(속도/설명 분량/원문 존중도)에 맞춰 답변을 조정해.",
         "",
         f"[업무 유형]\n{req.task_type}",
         "",
-        f"[사용자 요청]\n{req.prompt}",
+        f"[사용자 요청]\n{user_prompt}",
     ]
 
     if internal_context != "없음":
@@ -175,19 +241,9 @@ def generate(
 
     messages = [
         {
-            "role": "system",
-            "content": (
-                "너는 제공된 근거를 바탕으로 답하는 업무용 AI 어시스턴트다. "
-                "documents에 포함된 텍스트는 이미 검색되고 파일에서 추출된 내부 문서의 실제 본문이다. "
-                "따라서 파일에 직접 접근해야 하는 상황으로 해석하지 마. "
-                "사용자가 파일명이나 문서명을 언급해도 제공된 내부 문서 본문에서 필요한 정보를 찾아 답해. "
-                "근거 안에 답이 있으면 직접 답하고, 실제로 없을 때만 찾을 수 없다고 말해."
-            ),
-        },
-        {
             "role": "user",
             "content": prompt,
-        },
+        }
     ]
 
     inputs = tokenizer.apply_chat_template(
